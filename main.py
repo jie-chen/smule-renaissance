@@ -4,6 +4,7 @@ import torchaudio
 from pathlib import Path
 from spectral_ops import STFT, iSTFT
 from model import Renaissance
+import onnxruntime as ort
 
 def load_and_preprocess_audio(input_path, device, dtype):
     waveform, sr = torchaudio.load(input_path)
@@ -34,17 +35,32 @@ def normalize_audio(audio):
     return normalized_audio, normalization_factor
 
 
-def process_audio(model, stft, istft, input_wav, device):
+def process_audio(model, stft, istft, input_wav, export_path, device):
     input_wav_norm, norm_factor = normalize_audio(input_wav)
     
     with torch.no_grad():
         input_stft = stft(input_wav_norm)
-        
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            enhanced_stft = model(input_stft)
-        
-        enhanced_wav = istft(enhanced_stft)
-    
+
+        if export_path is None:
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                enhanced_stft = model(input_stft)
+        else:
+            torch.onnx.export(
+                model,
+                input_stft,  # Pass model inputs as a tuple
+                export_path,
+                verbose=False,
+                input_names=["input_stft"],  # List of strings for input names
+                output_names=["output_stft"],
+                dynamic_axes={
+                    "input_stft": {2: "frames"},
+                    "output_stft": {2: "frames"}
+                }
+            )
+            ort_sess = ort.InferenceSession(export_path)
+            enhanced_stft = torch.FloatTensor(ort_sess.run(None, {'input_stft': input_stft.numpy()})[0])
+
+    enhanced_wav = istft(enhanced_stft)
     if norm_factor > 0:
         enhanced_wav = enhanced_wav * norm_factor
     
@@ -71,6 +87,12 @@ def main():
         type=str,
         required=True,
         help="Model checkpoint path"
+    )
+    parser.add_argument(
+        "-e", "--export",
+        type=str,
+        default=None,
+        help="Model export path"
     )
     
     args = parser.parse_args()
@@ -100,7 +122,7 @@ def main():
     print(f"Audio duration: {input_wav.shape[1] / 48000:.2f} seconds")
     
     print("Processing audio...")
-    enhanced_wav = process_audio(model, stft, istft, input_wav, device)
+    enhanced_wav = process_audio(model, stft, istft, input_wav, args.export, device)
     
     print(f"Saving enhanced audio to {args.output}...")
     enhanced_wav_cpu = enhanced_wav.cpu().to(torch.float32)
